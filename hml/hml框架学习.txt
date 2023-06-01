@@ -1,0 +1,129 @@
+目前步骤
+1:ds_sal_init (打开os层设备句柄，准备好驱动)
+2:dsh_init (打开dtof设备并选择驱动)
+
+
+疑问1:创建dtof设备的时候分配ds_driver_control_s对象, sensor_flags 指定spi,i2c,simulator 类型，
+在ds_device_init时候,通过 ds_sal_getdriver(driverid)为设备选择驱动。
+他们hm项目目前我发现有一个功能，上位机可以通过下发指令来切换通信协议(i2c->spi)
+SEND_CHANGE_INTERFACE = 0x4A
+
+那么我看hml目前代码要做这功能，只能 ds_device_init，ds_device_deinit来做，有没有可能做到ds_driver_control_s对象里面
+增加change_interface 的函数来实现?
+
+
+#define DSC_DEVICE_VETOR_MAX 2
+疑问2: dsd_read_reg 里面支持循环从 i2c,spi,simulator 读取意义是？返回还是只有一个值 uint16_t* reg_data_p?
+而且我目前没能看明白，如果构造一个设备能同时支持 i2c + simulator的。
+
+
+疑问3 dsh_init
+uint32_t driverid = 2;应该是simulator，不管是按照通信类型还是设备编号，建议还是定义一个宏来表示,应该是指有意义的那个数字，虽然目前我们只有一个单点dtof
+
+
+疑问4
+1:关于HML项目串口通信协议包长度优化，以及担心包标识(头，尾在包中重复出现导致可能的问题) 个人一点想法
+目前串口通信协议大体分以下部分
+[标识头] + [消息头] + [消息体] + [CRC] + [标识尾]
+标识头、标识尾 修改为使用 0xAA 表示
+
+实际编码过程中
+若消息头,CRC，以及消息体中出现0xAA,0xAB，则要进行转义处理，转义规则定义如下：
+0xAA ←→ 0xAB后紧跟一个0x02
+0xAB ←→ 0xAB后紧跟一个0x01
+转义处理过程如下：
+发送消息时：消息封装 → 计算并填充CRC → 转义
+接收消息时：转义还原 → 验证CRC → 解析消息
+
+示例：
+发送一包内容为 0x30 0xaa 0x08 0xab 0x55 的数据包，则经过编码封装如下：0xaa 0x30 0xab 0x02 0x08 0xab 0x01 0x55 0xaa
+接收一包内容为 0xaa 0x30 0xab 0x02 0x08 0xab 0x01 0x55 0xaa  则经过解码封装如下 0x30 0xaa 0x08 0xab 0x55 (0xab+0x02 替换为 0xaa) (0xab+0x01 替换为 0xab)
+
+这样好像好处有
+1:优化了一些长度，包头包尾只要2byte
+2:不担心包体里面出现标识头
+3:后续做加密也不担心出现标识头
+
+
+疑问5 关于中断打断的事情(类MCU概念) 有时候做些事情不希望被中断打断，比如做holdrun的过程中，又来了其它指令，就进行排队处理
+需要维护一个内部状态机这个事情 (冰峰应该讲得更清楚)
+
+
+其它疑问关于porting 等，晚点想到再说
+
+
+
+1:appc_packet_malloc 用的是全局 txbuff，如果是一个串口处理命令，一个做log输出，会如何？需要修改吧
+2:就像之前说的 串口协议 max_len 目前已经到了1800,以后万一还有协议会继续变大？是否考虑预留是否分包的flag?
+3:appc_packet_malloc if (len >= RECEIVE_BUF_LEN) { 应该修改为判断>= payload？
+4:appc_packet_parse 解析命令长度时候 // command len is out of range if (session_p->pktlen >= RING_BUFFER_SIZE) { 应该不是和 RING_BUFFER_SIZE 比较?
+5:ds_driver_control_t结构里面的 hsl_api_functions 指针是在哪里初始化的了?我没有看到,还没实现的吧？
+6:DSHDRIVERS,APPCMDS 用了SECTION 编译技术，这个在arm64 linux也是支持的吗比如410
+
+
+static ds_driver_control_t ds_dev;
+
+
+ngdesign\modules\sdk\src\customer\dsc_base_type.h
+typedef struct dsc_device_vectors_s {
+  uint32_t  commid;
+/* Communication bus type */
+#define DSC_DEVICE_ENABEL_I2C 0X00000001
+#define DSC_DEVICE_ENABEL_SPI 0X00000002
+#define DSC_DEVICE_ENABEL_SIMILATER 0X00000004
+  uint32_t bus_type;
+  // type 1 : i2c  type 2 : spi
+  // return fd handle
+  // This function will do the config and init
+  // and when the test is passed, and then return the correct id
+  uint32_t (*sal_open_f)(const char *path, int oflag, ...);
+
+  int (*sal_readword_f)(int fildes, uint8_t addr, uint16_t *buf);
+
+  int (*sal_writeword_f)(int fildes, uint8_t addr, uint16_t buf);
+
+  int (*sal_read_burst_f)(int fildes, uint8_t addr, uint16_t *value,uint16_t len);
+
+  int (*sal_write_burst_f)(int fildes, uint8_t addr, uint16_t *value, uint16_t len);
+} dsc_device_vectors_t;
+
+ngdesign\modules\sdk\src\hal\inc\ds_dev.h
+typedef struct ds_driver_control_s {
+/* Device inited */
+#define SENSOR_F_INITED 0x01
+/* i2C enabled in SW and default value, SPI when unset*/
+#define SENSOR_F_I2C 0x02
+/* simulator*/
+#define SENSOR_F_SIMULATOR 0x04
+/* little Endian */
+/* little Endian */
+#define SENSOR_F_LITTLEENDIAN 0x08
+  /* Flags for the this device*/
+  uint32_t sensor_flags;
+  // the communication id
+  // this id will be shared by I2C and SPI
+  // the init value should be commu_fd
+  // the similator can work with i2c and spi
+  int commu_fd[DSC_DEVICE_VETOR_MAX];
+  // description
+  const char * desc_p[DSC_DEVICE_VETOR_MAX];
+  // OTP config
+#define DS_DEV_OTP_CONFIG_INITED  0x0001
+  uint16_t otp_base;
+  // TBD will do the malloc later
+  #define DS_DEV_MAX_OTP_SIZE  256
+  uint8_t  otp_config[DS_DEV_MAX_OTP_SIZE];
+
+  dsc_device_vectors_t *vector_p[DSC_DEVICE_VETOR_MAX];
+
+  configctrl_functions_t *drv_configctrl_functions; /* drv config functions*/
+
+  dspctrl_functions_t *dspctrl_functions;           /* dsp config functions*/
+  
+  runningctrl_functions_t *runningctrl_functions;   /*running config*/
+  
+  memctrl_functions_t *memctrl_functions;           /*memctrl*/
+  //
+  dshsl_api_t *hsl_api_functions;    // hsl api fucntions
+
+} ds_driver_control_t;
